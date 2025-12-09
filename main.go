@@ -92,6 +92,7 @@ type Simulation struct {
     dbMu      sync.Mutex
     srv       *S7Server
     listen    string
+    port      int
     stopCh    chan struct{}
     stoppedCh chan struct{}
 }
@@ -99,7 +100,8 @@ type Simulation struct {
 func main() {
     configPath := flag.String("config", "topway-data0-s7.csv", "path to the CSV configuration")
     dataPath := flag.String("data", filepath.Join("simdata", "sample_values.json"), "path to the simulation values file")
-    listen := flag.String("listen", "", "IP address to bind the S7 server to (defaults to server address from CSV)")
+    listen := flag.String("listen", "0.0.0.0", "IP address to bind the S7 server to (use empty to let Snap7 choose)")
+    port := flag.Int("port", 1102, "TCP port to listen on (default 1102 to avoid root; set 102 for classic ISO-on-TCP)")
     flag.Parse()
 
     cfg, err := loadConfig(*configPath)
@@ -120,7 +122,7 @@ func main() {
         listenAddr = cfg.Server.Address
     }
 
-    sim := newSimulation(cfg, sample, listenAddr)
+    sim := newSimulation(cfg, sample, listenAddr, *port)
     if err := sim.start(); err != nil {
         log.Fatalf("failed to start S7 server: %v", err)
     }
@@ -157,12 +159,13 @@ func main() {
     }
 }
 
-func newSimulation(cfg Config, sample SampleData, listen string) *Simulation {
+func newSimulation(cfg Config, sample SampleData, listen string, port int) *Simulation {
     s := &Simulation{
         cfg:       cfg,
         sample:    sample,
         dbAreas:   map[int][]byte{},
         listen:    listen,
+        port:      port,
         stopCh:    make(chan struct{}),
         stoppedCh: make(chan struct{}),
     }
@@ -177,14 +180,25 @@ func (s *Simulation) start() error {
     if err != nil {
         return err
     }
+    if s.port > 0 {
+        if res := srv.SetPort(uint16(s.port)); res != 0 {
+            return fmt.Errorf("set port %d failed (code %d: %s)", s.port, res, srv.ErrorText(res))
+        }
+    }
     for dbNum, buf := range s.dbAreas {
         if res := srv.RegisterArea(srvAreaDB, dbNum, buf); res != 0 {
             return fmt.Errorf("register DB%d failed (code %d)", dbNum, res)
         }
     }
 
-    if res := srv.StartTo(s.listen); res != 0 {
-        return fmt.Errorf("start server failed (code %d)", res)
+    var res int
+    if s.listen == "" {
+        res = srv.Start()
+    } else {
+        res = srv.StartTo(s.listen)
+    }
+    if res != 0 {
+        return fmt.Errorf("start server failed (code %d: %s)", res, srv.ErrorText(res))
     }
 
     s.srv = srv
@@ -404,14 +418,14 @@ func loadConfig(path string) (Config, error) {
             cfg.Points = append(cfg.Points, def)
             cfg.pointByKey[key] = def
         case "[alarm]":
-            if len(rec) < 6 {
+            if len(rec) < 7 {
                 continue
             }
             serverID, _ := strconv.Atoi(rec[1])
             db, byteOffset, _ := parseDBOffset(rec[2])
             bit, _ := strconv.Atoi(rec[3])
             val, _ := strconv.Atoi(rec[4])
-            msg := strings.TrimSpace(rec[5])
+            msg := strings.TrimSpace(rec[6])
             def := AlarmDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val, Message: msg}
             cfg.Alarms = append(cfg.Alarms, def)
             if msg != "" {

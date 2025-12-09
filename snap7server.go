@@ -11,14 +11,19 @@ import (
     "unsafe"
 )
 
-// srvArea* constants mirror Snap7 server area codes.
+// srvArea* constants mirror Snap7 server area codes (not the client S7Area* codes).
 const (
-    srvAreaPE = 0x81
-    srvAreaPA = 0x82
-    srvAreaMK = 0x83
-    srvAreaDB = 0x84
-    srvAreaCT = 0x1C
-    srvAreaTM = 0x1D
+    srvAreaPE = 0 // Inputs
+    srvAreaPA = 1 // Outputs
+    srvAreaMK = 2 // Merkers
+    srvAreaCT = 3 // Counters
+    srvAreaTM = 4 // Timers
+    srvAreaDB = 5 // Data blocks
+)
+
+// server param numbers (see snap7.h p_u16_LocalPort, ...).
+const (
+    paramLocalPort = 1
 )
 
 // S7Server is a light wrapper around Snap7 S7Object-based server.
@@ -47,10 +52,29 @@ func (s *S7Server) StartTo(addr string) int {
     return int(C.Srv_StartTo(s.obj, cstr))
 }
 
+func (s *S7Server) Start() int {
+    return int(C.Srv_Start(s.obj))
+}
+
 func (s *S7Server) Stop() int {
     return int(C.Srv_Stop(s.obj))
 }
 
 func (s *S7Server) Destroy() {
     C.Srv_Destroy((*C.S7Object)(&s.obj))
+}
+
+func (s *S7Server) ErrorText(code int) string {
+    buf := make([]byte, 256)
+    C.Srv_ErrorText(C.int(code), (*C.char)(unsafe.Pointer(&buf[0])), C.int(len(buf)))
+    return C.GoString((*C.char)(unsafe.Pointer(&buf[0])))
+}
+
+func (s *S7Server) SetParam(param int, value unsafe.Pointer) int {
+    return int(C.Srv_SetParam(s.obj, C.int(param), value))
+}
+
+// SetPort updates the listening port before Start/StartTo.
+func (s *S7Server) SetPort(port uint16) int {
+    return s.SetParam(paramLocalPort, unsafe.Pointer(&port))
 }

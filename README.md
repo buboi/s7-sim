@@ -10,8 +10,12 @@ This spins up a Snap7 server that mirrors the layout described in `topway-data0-
 ```bash
 # run the simulator (ensure libsnap7 is installed on the system)
 go run . -config topway-data0-s7.csv -data simdata/sample_values.json \
-  -listen 0.0.0.0
+  -listen 0.0.0.0 -port 1102
 ```
+
+Notes:
+- Default port is 1102 to avoid root. Use `-port 102` only if you can bind low ports (root or `setcap 'cap_net_bind_service=+ep' $(which go)`).
+- Leave `-listen` empty to let Snap7 pick an interface, or specify a local IP/NIC address; `0.0.0.0` usually works.
 
 Flags:
 - `-config` CSV file following the existing format.
