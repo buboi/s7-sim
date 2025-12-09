@@ -41,6 +41,12 @@ type PointDef struct {
     RegisterType string
     Multiplier   int
     DataType     string
+    ControlDB    int
+    ControlOff   int
+    LowDB        int
+    LowOff       int
+    HighDB       int
+    HighOff      int
 }
 
 // AlarmDef maps a single alarm bit.
@@ -77,6 +83,9 @@ type Frame struct {
     WaitMS int                `json:"wait_ms"`
     States map[string]int     `json:"states"`
     Points map[string]float64 `json:"points"`
+    CV     map[string]float64 `json:"cv"`
+    LA     map[string]float64 `json:"la"`
+    HA     map[string]float64 `json:"ha"`
     Alarms []string           `json:"alarms"`
 }
 
@@ -226,6 +235,15 @@ func (s *Simulation) ensureDBLayout() {
     for _, p := range s.cfg.Points {
         l := p.ByteOffset + registerLength(p.RegisterType, p.DataType)
         s.ensureSize(p.DB, l)
+        if p.ControlDB > 0 {
+            s.ensureSize(p.ControlDB, p.ControlOff+registerLength(p.RegisterType, p.DataType))
+        }
+        if p.LowDB > 0 {
+            s.ensureSize(p.LowDB, p.LowOff+registerLength(p.RegisterType, p.DataType))
+        }
+        if p.HighDB > 0 {
+            s.ensureSize(p.HighDB, p.HighOff+registerLength(p.RegisterType, p.DataType))
+        }
     }
     for _, a := range s.cfg.Alarms {
         s.ensureSize(a.DB, a.ByteOffset+1)
@@ -286,6 +304,41 @@ func (s *Simulation) applyFrame(frame Frame) {
         }
         raw := val * float64(def.Multiplier)
         s.writeValue(def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
+    }
+
+    // Control value (CV), low alarm (LA), high alarm (HA) writing to offsets in DB20.
+    for key, val := range frame.CV {
+        def, ok := s.cfg.pointByKey[key]
+        if !ok || def.ControlDB == 0 {
+            if !ok {
+                log.Printf("unknown cv point %q in frame %s", key, frame.Name)
+            }
+            continue
+        }
+        raw := val * float64(def.Multiplier)
+        s.writeValue(def.ControlDB, def.ControlOff, def.RegisterType, def.DataType, raw)
+    }
+    for key, val := range frame.LA {
+        def, ok := s.cfg.pointByKey[key]
+        if !ok || def.LowDB == 0 {
+            if !ok {
+                log.Printf("unknown la point %q in frame %s", key, frame.Name)
+            }
+            continue
+        }
+        raw := val * float64(def.Multiplier)
+        s.writeValue(def.LowDB, def.LowOff, def.RegisterType, def.DataType, raw)
+    }
+    for key, val := range frame.HA {
+        def, ok := s.cfg.pointByKey[key]
+        if !ok || def.HighDB == 0 {
+            if !ok {
+                log.Printf("unknown ha point %q in frame %s", key, frame.Name)
+            }
+            continue
+        }
+        raw := val * float64(def.Multiplier)
+        s.writeValue(def.HighDB, def.HighOff, def.RegisterType, def.DataType, raw)
     }
 
     // Alarms: clear all first, then set the ones listed for this frame.
@@ -413,8 +466,28 @@ func loadConfig(path string) (Config, error) {
             regType := strings.TrimSpace(rec[6])
             mult, _ := strconv.Atoi(defaultStr(rec[7], "1"))
             dataType := strings.TrimSpace(rec[8])
+            ctrlDB, ctrlOff, _ := parseDBOffset(rec[9])
+            lowDB, lowOff, _ := parseDBOffset(rec[10])
+            highDB, highOff, _ := parseDBOffset(rec[11])
             key := fmt.Sprintf("%d:%s", tankID, name)
-            def := PointDef{Key: key, TankID: tankID, Name: name, Unit: unit, ServerID: serverID, DB: db, ByteOffset: byteOffset, RegisterType: regType, Multiplier: mult, DataType: dataType}
+            def := PointDef{
+                Key:          key,
+                TankID:       tankID,
+                Name:         name,
+                Unit:         unit,
+                ServerID:     serverID,
+                DB:           db,
+                ByteOffset:   byteOffset,
+                RegisterType: regType,
+                Multiplier:   mult,
+                DataType:     dataType,
+                ControlDB:    ctrlDB,
+                ControlOff:   ctrlOff,
+                LowDB:        lowDB,
+                LowOff:       lowOff,
+                HighDB:       highDB,
+                HighOff:      highOff,
+            }
             cfg.Points = append(cfg.Points, def)
             cfg.pointByKey[key] = def
         case "[alarm]":
