@@ -14,7 +14,7 @@ go run . -config topway-data0-s7.csv -data simdata/sample_values.json \
 ```
 
 Notes:
-- Default port is 1102 to avoid root. Use `-port 102` only if you can bind low ports (root or `setcap 'cap_net_bind_service=+ep' $(which go)`).
+- Default port is taken from the CSV `[server]` connection string `IP|rack|slot|port` (port optional). If absent it falls back to 1102 to avoid root. Use `-port 102` only if you can bind low ports (root or `setcap 'cap_net_bind_service=+ep' $(which go)`).
 - Leave `-listen` empty to let Snap7 pick an interface, or specify a local IP/NIC address; `0.0.0.0` usually works.
 
 Flags:
