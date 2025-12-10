@@ -69,13 +69,26 @@ type StateDef struct {
 	Value      int
 }
 
+// DosingDef maps a dosing chemical name to a DB/offset for amount.
+type DosingDef struct {
+	Name         string
+	TankID       int
+	DB           int
+	ByteOffset   int
+	RegisterType string
+	Multiplier   int
+	DataType     string
+}
+
 type Config struct {
 	Server      ServerDef
 	Points      []PointDef
 	Alarms      []AlarmDef
 	States      []StateDef
+	Dosing      []DosingDef
 	pointByKey  map[string]PointDef
 	alarmByText map[string]AlarmDef
+	doseByName  map[string]DosingDef
 }
 
 // Frame contains one snapshot of simulated data.
@@ -87,6 +100,7 @@ type Frame struct {
 	CV     map[string]float64 `json:"cv"`
 	LA     map[string]float64 `json:"la"`
 	HA     map[string]float64 `json:"ha"`
+	Dosing map[string]float64 `json:"dosing"`
 	Alarms []string           `json:"alarms"`
 }
 
@@ -261,6 +275,10 @@ func (s *Simulation) ensureDBLayout() {
 	for _, st := range s.cfg.States {
 		s.ensureSize(st.DB, st.ByteOffset+1)
 	}
+	for _, d := range s.cfg.Dosing {
+		l := d.ByteOffset + registerLength(d.RegisterType, d.DataType)
+		s.ensureSize(d.DB, l)
+	}
 }
 
 // ensureSampleLayout grows DBs to fit any state bits referenced in sample frames.
@@ -329,6 +347,21 @@ func (s *Simulation) applyFrame(frame Frame) {
 			def.Multiplier = 1
 		}
 		raw := val * float64(def.Multiplier)
+		s.writeValue(def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
+	}
+
+	// Dosing amounts keyed by chemical name (matches CSV dosing name).
+	for key, val := range frame.Dosing {
+		def, ok := s.cfg.doseByName[key]
+		if !ok {
+			log.Printf("unknown dosing %q in frame %s", key, frame.Name)
+			continue
+		}
+		mult := def.Multiplier
+		if mult == 0 {
+			mult = 1
+		}
+		raw := val * float64(mult)
 		s.writeValue(def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
 	}
 
@@ -453,6 +486,7 @@ func loadConfig(path string) (Config, error) {
 	var cfg Config
 	cfg.pointByKey = map[string]PointDef{}
 	cfg.alarmByText = map[string]AlarmDef{}
+	cfg.doseByName = map[string]DosingDef{}
 
 	for {
 		rec, err := r.Read()
@@ -540,6 +574,29 @@ func loadConfig(path string) (Config, error) {
 			val, _ := strconv.Atoi(rec[5])
 			def := StateDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val}
 			cfg.States = append(cfg.States, def)
+
+			// For dosing rows, also capture amount target information.
+			if tag == "[state-dosing]" && len(rec) >= 15 {
+				tankID, _ := strconv.Atoi(rec[6])
+				name := strings.TrimSpace(rec[9])
+				doseDB, doseOff, _ := parseDBOffset(rec[10])
+				doseRegType := strings.TrimSpace(rec[11])
+				mult, _ := strconv.Atoi(defaultStr(rec[13], "1"))
+				dataType := strings.TrimSpace(rec[14])
+				doseDef := DosingDef{
+					Name:         name,
+					TankID:       tankID,
+					DB:           doseDB,
+					ByteOffset:   doseOff,
+					RegisterType: doseRegType,
+					Multiplier:   mult,
+					DataType:     dataType,
+				}
+				cfg.Dosing = append(cfg.Dosing, doseDef)
+				if name != "" {
+					cfg.doseByName[name] = doseDef
+				}
+			}
 		}
 	}
 
@@ -568,7 +625,7 @@ func parseDBOffset(raw string) (db int, byteOffset int, err error) {
 	if raw == "" {
 		return 0, 0, fmt.Errorf("empty DB offset")
 	}
-	parts := strings.Split(raw, ":")
+	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == ':' || r == '|' })
 	if len(parts) == 1 {
 		// Treat single number as DB number with zero offset.
 		db, err = strconv.Atoi(parts[0])
