@@ -67,6 +67,7 @@ type StateDef struct {
 	ByteOffset int
 	Bit        int
 	Value      int
+	Area       string
 }
 
 // DosingDef maps a dosing chemical name to a DB/offset for amount.
@@ -113,6 +114,7 @@ type Simulation struct {
 	cfg       Config
 	sample    SampleData
 	dbAreas   map[int][]byte
+	qArea     []byte
 	dbMu      sync.Mutex
 	srv       *S7Server
 	listen    string
@@ -196,6 +198,7 @@ func newSimulation(cfg Config, sample SampleData, listen string, port int) *Simu
 		cfg:       cfg,
 		sample:    sample,
 		dbAreas:   map[int][]byte{},
+		qArea:     []byte{},
 		listen:    listen,
 		port:      port,
 		stopCh:    make(chan struct{}),
@@ -221,6 +224,11 @@ func (s *Simulation) start() error {
 	for dbNum, buf := range s.dbAreas {
 		if res := srv.RegisterArea(srvAreaDB, dbNum, buf); res != 0 {
 			return fmt.Errorf("register DB%d failed (code %d)", dbNum, res)
+		}
+	}
+	if len(s.qArea) > 0 {
+		if res := srv.RegisterArea(srvAreaPA, 0, s.qArea); res != 0 {
+			return fmt.Errorf("register Q area failed (code %d)", res)
 		}
 	}
 
@@ -258,7 +266,8 @@ func (s *Simulation) dbNumbers() []int {
 func (s *Simulation) ensureDBLayout() {
 	for _, p := range s.cfg.Points {
 		l := p.ByteOffset + registerLength(p.RegisterType, p.DataType)
-		s.ensureSize(p.DB, l)
+		area := areaFromRegType(p.RegisterType)
+		s.ensureSizeArea(area, p.DB, l)
 		if p.ControlDB > 0 {
 			s.ensureSize(p.ControlDB, p.ControlOff+registerLength(p.RegisterType, p.DataType))
 		}
@@ -273,11 +282,16 @@ func (s *Simulation) ensureDBLayout() {
 		s.ensureSize(a.DB, a.ByteOffset+1)
 	}
 	for _, st := range s.cfg.States {
-		s.ensureSize(st.DB, st.ByteOffset+1)
+		area := st.Area
+		if area == "" {
+			area = "db"
+		}
+		s.ensureSizeArea(area, st.DB, st.ByteOffset+1)
 	}
 	for _, d := range s.cfg.Dosing {
 		l := d.ByteOffset + registerLength(d.RegisterType, d.DataType)
-		s.ensureSize(d.DB, l)
+		area := areaFromRegType(d.RegisterType)
+		s.ensureSizeArea(area, d.DB, l)
 	}
 }
 
@@ -287,12 +301,12 @@ func (s *Simulation) ensureDBLayout() {
 func (s *Simulation) ensureSampleLayout() {
 	for _, frame := range s.sample.Frames {
 		for key := range frame.States {
-			db, byt, _, err := parseStateKey(key)
+			area, db, byt, _, err := parseStateKey(key)
 			if err != nil {
 				log.Printf("skip sizing state %q: %v", key, err)
 				continue
 			}
-			s.ensureSize(db, byt+1)
+			s.ensureSizeArea(area, db, byt+1)
 		}
 	}
 }
@@ -300,10 +314,14 @@ func (s *Simulation) ensureSampleLayout() {
 func (s *Simulation) applyDefaults() {
 	// Set default states and alarm bits based on config values.
 	for _, st := range s.cfg.States {
-		s.setBit(st.DB, st.ByteOffset, st.Bit, st.Value != 0)
+		area := st.Area
+		if area == "" {
+			area = "db"
+		}
+		s.setBit(area, st.DB, st.ByteOffset, st.Bit, st.Value != 0)
 	}
 	for _, a := range s.cfg.Alarms {
-		s.setBit(a.DB, a.ByteOffset, a.Bit, a.Value != 0)
+		s.setBit("db", a.DB, a.ByteOffset, a.Bit, a.Value != 0)
 	}
 }
 
@@ -321,19 +339,39 @@ func (s *Simulation) ensureSize(db int, required int) {
 	}
 }
 
+func (s *Simulation) ensureSizeArea(area string, db int, required int) {
+	switch strings.ToLower(area) {
+	case "q":
+		if len(s.qArea) < required {
+			bigger := make([]byte, required)
+			copy(bigger, s.qArea)
+			s.qArea = bigger
+		}
+	default:
+		s.ensureSize(db, required)
+	}
+}
+
+func (s *Simulation) bufferForArea(area string, db int) []byte {
+	if strings.ToLower(area) == "q" {
+		return s.qArea
+	}
+	return s.dbAreas[db]
+}
+
 func (s *Simulation) applyFrame(frame Frame) {
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
 
 	// States: keys formatted as "<db>:<byte>:<bit>".
 	for key, v := range frame.States {
-		db, byt, bit, err := parseStateKey(key)
+		area, db, byt, bit, err := parseStateKey(key)
 		if err != nil {
 			log.Printf("skip state %q: %v", key, err)
 			continue
 		}
-		s.ensureSize(db, byt+1)
-		s.setBit(db, byt, bit, v != 0)
+		s.ensureSizeArea(area, db, byt+1)
+		s.setBit(area, db, byt, bit, v != 0)
 	}
 
 	// Points keyed by "<tankID>:<point name>".
@@ -347,7 +385,8 @@ func (s *Simulation) applyFrame(frame Frame) {
 			def.Multiplier = 1
 		}
 		raw := val * float64(def.Multiplier)
-		s.writeValue(def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
+			area := areaFromRegType(def.RegisterType)
+			s.writeValue(area, def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
 	}
 
 	// Dosing amounts keyed by chemical name (matches CSV dosing name).
@@ -362,7 +401,8 @@ func (s *Simulation) applyFrame(frame Frame) {
 			mult = 1
 		}
 		raw := val * float64(mult)
-		s.writeValue(def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
+		area := areaFromRegType(def.RegisterType)
+		s.writeValue(area, def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
 	}
 
 	// Control value (CV), low alarm (LA), high alarm (HA) writing to offsets in DB20.
@@ -375,7 +415,8 @@ func (s *Simulation) applyFrame(frame Frame) {
 			continue
 		}
 		raw := val * float64(def.Multiplier)
-		s.writeValue(def.ControlDB, def.ControlOff, def.RegisterType, def.DataType, raw)
+		area := areaFromRegType(def.RegisterType)
+		s.writeValue(area, def.ControlDB, def.ControlOff, def.RegisterType, def.DataType, raw)
 	}
 	for key, val := range frame.LA {
 		def, ok := s.cfg.pointByKey[key]
@@ -386,7 +427,8 @@ func (s *Simulation) applyFrame(frame Frame) {
 			continue
 		}
 		raw := val * float64(def.Multiplier)
-		s.writeValue(def.LowDB, def.LowOff, def.RegisterType, def.DataType, raw)
+		area := areaFromRegType(def.RegisterType)
+		s.writeValue(area, def.LowDB, def.LowOff, def.RegisterType, def.DataType, raw)
 	}
 	for key, val := range frame.HA {
 		def, ok := s.cfg.pointByKey[key]
@@ -397,12 +439,13 @@ func (s *Simulation) applyFrame(frame Frame) {
 			continue
 		}
 		raw := val * float64(def.Multiplier)
-		s.writeValue(def.HighDB, def.HighOff, def.RegisterType, def.DataType, raw)
+		area := areaFromRegType(def.RegisterType)
+		s.writeValue(area, def.HighDB, def.HighOff, def.RegisterType, def.DataType, raw)
 	}
 
 	// Alarms: clear all first, then set the ones listed for this frame.
 	for _, a := range s.cfg.Alarms {
-		s.setBit(a.DB, a.ByteOffset, a.Bit, false)
+		s.setBit("db", a.DB, a.ByteOffset, a.Bit, false)
 	}
 	for _, name := range frame.Alarms {
 		def, ok := s.cfg.alarmByText[name]
@@ -410,19 +453,19 @@ func (s *Simulation) applyFrame(frame Frame) {
 			log.Printf("unknown alarm %q in frame %s", name, frame.Name)
 			continue
 		}
-		s.setBit(def.DB, def.ByteOffset, def.Bit, true)
+		s.setBit("db", def.DB, def.ByteOffset, def.Bit, true)
 	}
 
 	// log.Printf("applied frame %q", frame.Name)
 }
 
-func (s *Simulation) writeValue(db, byteOffset int, regType, dataType string, value float64) {
+func (s *Simulation) writeValue(area string, db, byteOffset int, regType, dataType string, value float64) {
 	regType = strings.ToLower(regType)
 	dataType = strings.ToUpper(dataType)
 
 	switch regType {
-	case "dbw", "dbx":
-		// Most fields use two-byte WORDs or single bits.
+	case "dbw", "dbx", "q", "qx":
+		// Two-byte WORDs or single bits.
 	default:
 		log.Printf("unsupported register type %s", regType)
 		return
@@ -433,38 +476,49 @@ func (s *Simulation) writeValue(db, byteOffset int, regType, dataType string, va
 		if value < 0 {
 			value = 0
 		}
-		s.ensureSize(db, byteOffset+2)
-		binary.BigEndian.PutUint16(s.dbAreas[db][byteOffset:], uint16(value))
+		s.ensureSizeArea(area, db, byteOffset+2)
+		buf := s.bufferForArea(area, db)
+		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(value))
 	case "S16", "INT":
-		s.ensureSize(db, byteOffset+2)
-		binary.BigEndian.PutUint16(s.dbAreas[db][byteOffset:], uint16(int16(value)))
+		s.ensureSizeArea(area, db, byteOffset+2)
+		buf := s.bufferForArea(area, db)
+		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(int16(value)))
 	case "U32", "DINT":
 		if value < 0 {
 			value = 0
 		}
-		s.ensureSize(db, byteOffset+4)
-		binary.BigEndian.PutUint32(s.dbAreas[db][byteOffset:], uint32(value))
+		s.ensureSizeArea(area, db, byteOffset+4)
+		buf := s.bufferForArea(area, db)
+		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(value))
 	case "S32":
-		s.ensureSize(db, byteOffset+4)
-		binary.BigEndian.PutUint32(s.dbAreas[db][byteOffset:], uint32(int32(value)))
+		s.ensureSizeArea(area, db, byteOffset+4)
+		buf := s.bufferForArea(area, db)
+		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(int32(value)))
 	case "REAL", "FLOAT":
-		s.ensureSize(db, byteOffset+4)
+		s.ensureSizeArea(area, db, byteOffset+4)
+		buf := s.bufferForArea(area, db)
 		bits := math.Float32bits(float32(value))
-		binary.BigEndian.PutUint32(s.dbAreas[db][byteOffset:], bits)
+		binary.BigEndian.PutUint32(buf[byteOffset:], bits)
 	default:
 		// Default to 16-bit unsigned for unknown entries.
-		s.ensureSize(db, byteOffset+2)
-		binary.BigEndian.PutUint16(s.dbAreas[db][byteOffset:], uint16(value))
+		s.ensureSizeArea(area, db, byteOffset+2)
+		buf := s.bufferForArea(area, db)
+		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(value))
 	}
 }
 
-func (s *Simulation) setBit(db, byteOffset, bit int, on bool) {
+func (s *Simulation) setBit(area string, db, byteOffset, bit int, on bool) {
 	if bit < 0 || bit > 7 {
 		log.Printf("invalid bit index %d", bit)
 		return
 	}
-	s.ensureSize(db, byteOffset+1)
-	buf := s.dbAreas[db]
+	s.ensureSizeArea(area, db, byteOffset+1)
+	var buf []byte
+	if strings.ToLower(area) == "q" {
+		buf = s.qArea
+	} else {
+		buf = s.dbAreas[db]
+	}
 	mask := byte(1 << bit)
 	if on {
 		buf[byteOffset] |= mask
@@ -570,9 +624,11 @@ func loadConfig(path string) (Config, error) {
 			}
 			serverID, _ := strconv.Atoi(rec[1])
 			db, byteOffset, _ := parseDBOffset(rec[2])
+			regType := strings.TrimSpace(rec[3])
+			area := areaFromRegType(regType)
 			bit, _ := strconv.Atoi(rec[4])
 			val, _ := strconv.Atoi(rec[5])
-			def := StateDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val}
+			def := StateDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val, Area: area}
 			cfg.States = append(cfg.States, def)
 
 			// For dosing rows, also capture amount target information.
@@ -652,14 +708,20 @@ func parseAddress(raw string) (addr string, rack int, slot int, port int) {
     return
 }
 
-func parseStateKey(raw string) (db int, byteOffset int, bit int, err error) {
+func parseStateKey(raw string) (area string, db int, byteOffset int, bit int, err error) {
 	parts := strings.Split(raw, ":")
 	if len(parts) != 3 {
 		err = fmt.Errorf("state key should look like DB:BYTE:BIT")
 		return
 	}
-	if db, err = strconv.Atoi(parts[0]); err != nil {
-		return
+	first := strings.ToLower(parts[0])
+	if first == "q" {
+		area = "q"
+	} else {
+		area = "db"
+		if db, err = strconv.Atoi(parts[0]); err != nil {
+			return
+		}
 	}
 	if byteOffset, err = strconv.Atoi(parts[1]); err != nil {
 		return
@@ -672,7 +734,7 @@ func registerLength(regType, dataType string) int {
 	regType = strings.ToLower(regType)
 	dataType = strings.ToUpper(dataType)
 
-	if regType == "dbx" {
+	if regType == "dbx" || regType == "qx" || regType == "q" {
 		return 1
 	}
 
@@ -681,6 +743,15 @@ func registerLength(regType, dataType string) int {
 		return 4
 	default:
 		return 2
+	}
+}
+
+func areaFromRegType(regType string) string {
+	switch strings.ToLower(regType) {
+	case "q", "qx", "qb", "qw", "qdw":
+		return "q"
+	default:
+		return "db"
 	}
 }
 
