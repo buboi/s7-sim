@@ -189,6 +189,7 @@ func newSimulation(cfg Config, sample SampleData, listen string, port int) *Simu
 	}
 
 	s.ensureDBLayout()
+	s.ensureSampleLayout()
 	s.applyDefaults()
 	return s
 }
@@ -259,6 +260,22 @@ func (s *Simulation) ensureDBLayout() {
 	}
 	for _, st := range s.cfg.States {
 		s.ensureSize(st.DB, st.ByteOffset+1)
+	}
+}
+
+// ensureSampleLayout grows DBs to fit any state bits referenced in sample frames.
+// This prevents later resizes (and stale Snap7 registrations) when frames contain
+// state bits outside the CSV-defined offsets.
+func (s *Simulation) ensureSampleLayout() {
+	for _, frame := range s.sample.Frames {
+		for key := range frame.States {
+			db, byt, _, err := parseStateKey(key)
+			if err != nil {
+				log.Printf("skip sizing state %q: %v", key, err)
+				continue
+			}
+			s.ensureSize(db, byt+1)
+		}
 	}
 }
 
@@ -513,14 +530,14 @@ func loadConfig(path string) (Config, error) {
 			if msg != "" {
 				cfg.alarmByText[msg] = def
 			}
-		case "[state-trigger]":
+		case "[state-trigger]", "[state-dosing]":
 			if len(rec) < 6 {
 				continue
 			}
 			serverID, _ := strconv.Atoi(rec[1])
 			db, byteOffset, _ := parseDBOffset(rec[2])
-			bit, _ := strconv.Atoi(rec[3])
-			val, _ := strconv.Atoi(rec[4])
+			bit, _ := strconv.Atoi(rec[4])
+			val, _ := strconv.Atoi(rec[5])
 			def := StateDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val}
 			cfg.States = append(cfg.States, def)
 		}
