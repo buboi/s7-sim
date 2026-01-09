@@ -101,6 +101,7 @@ type Frame struct {
 	CV     map[string]float64 `json:"cv"`
 	LA     map[string]float64 `json:"la"`
 	HA     map[string]float64 `json:"ha"`
+	Words  map[string]float64 `json:"words"`
 	Dosing map[string]float64 `json:"dosing"`
 	Alarms []string           `json:"alarms"`
 }
@@ -134,6 +135,25 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
+	log.Printf("loaded config %s (server=%s rack=%d slot=%d port=%d points=%d alarms=%d states=%d dosing=%d)",
+		*configPath, cfg.Server.Address, cfg.Server.Rack, cfg.Server.Slot, cfg.Server.Port,
+		len(cfg.Points), len(cfg.Alarms), len(cfg.States), len(cfg.Dosing))
+	if len(cfg.Points) > 0 {
+		p := cfg.Points[0]
+		log.Printf("first point: tank=%d name=%q db=%d byte=%d reg=%s mult=%d type=%s cv=%d|%d la=%d|%d ha=%d|%d",
+			p.TankID, p.Name, p.DB, p.ByteOffset, p.RegisterType, p.Multiplier, p.DataType,
+			p.ControlDB, p.ControlOff, p.LowDB, p.LowOff, p.HighDB, p.HighOff)
+	}
+	if len(cfg.States) > 0 {
+		st := cfg.States[0]
+		log.Printf("first state: area=%s db=%d byte=%d bit=%d value=%d",
+			st.Area, st.DB, st.ByteOffset, st.Bit, st.Value)
+	}
+	if len(cfg.Dosing) > 0 {
+		d := cfg.Dosing[0]
+		log.Printf("first dosing: tank=%d name=%q db=%d byte=%d reg=%s mult=%d type=%s",
+			d.TankID, d.Name, d.DB, d.ByteOffset, d.RegisterType, d.Multiplier, d.DataType)
+	}
 
 	sample, err := loadSampleData(*dataPath)
 	if err != nil {
@@ -141,6 +161,23 @@ func main() {
 	}
 	if len(sample.Frames) == 0 {
 		log.Fatalf("sample data %s contains no frames", *dataPath)
+	}
+	firstFrame := sample.Frames[0]
+	log.Printf("loaded sample %s (interval_ms=%d frames=%d first=%q states=%d points=%d cv=%d la=%d ha=%d dosing=%d alarms=%d)",
+		*dataPath, sample.IntervalMS, len(sample.Frames), firstFrame.Name,
+		len(firstFrame.States), len(firstFrame.Points), len(firstFrame.CV),
+		len(firstFrame.LA), len(firstFrame.HA), len(firstFrame.Dosing), len(firstFrame.Alarms))
+	for key, val := range firstFrame.Points {
+		log.Printf("first sample point: %s=%.3f", key, val)
+		break
+	}
+	for key, val := range firstFrame.States {
+		log.Printf("first sample state: %s=%d", key, val)
+		break
+	}
+	for key, val := range firstFrame.Dosing {
+		log.Printf("first sample dosing: %s=%.3f", key, val)
+		break
 	}
 
     listenAddr := *listen
@@ -308,6 +345,14 @@ func (s *Simulation) ensureSampleLayout() {
 			}
 			s.ensureSizeArea(area, db, byt+1)
 		}
+		for key := range frame.Words {
+			area, db, byt, err := parseWordKey(key)
+			if err != nil {
+				log.Printf("skip sizing word %q: %v", key, err)
+				continue
+			}
+			s.ensureSizeArea(area, db, byt+2)
+		}
 	}
 }
 
@@ -389,6 +434,20 @@ func (s *Simulation) applyFrame(frame Frame) {
 			s.writeValue(area, def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
 	}
 
+	// Raw WORDs keyed by "DB:BYTE" (or "Q:BYTE").
+	for key, val := range frame.Words {
+		area, db, byt, err := parseWordKey(key)
+		if err != nil {
+			log.Printf("skip word %q: %v", key, err)
+			continue
+		}
+		regType := "dbw"
+		if area == "q" {
+			regType = "q"
+		}
+		s.writeValue(area, db, byt, regType, "U16", val)
+	}
+
 	// Dosing amounts keyed by chemical name (matches CSV dosing name).
 	for key, val := range frame.Dosing {
 		def, ok := s.cfg.doseByName[key]
@@ -464,8 +523,8 @@ func (s *Simulation) writeValue(area string, db, byteOffset int, regType, dataTy
 	dataType = strings.ToUpper(dataType)
 
 	switch regType {
-	case "dbw", "dbx", "q", "qx":
-		// Two-byte WORDs or single bits.
+	case "dbw", "dbx", "dbd", "q", "qx", "qdw":
+		// WORDs, DWORDs, or single bits.
 	default:
 		log.Printf("unsupported register type %s", regType)
 		return
@@ -494,7 +553,7 @@ func (s *Simulation) writeValue(area string, db, byteOffset int, regType, dataTy
 		s.ensureSizeArea(area, db, byteOffset+4)
 		buf := s.bufferForArea(area, db)
 		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(int32(value)))
-	case "REAL", "FLOAT":
+	case "REAL", "FLOAT", "F32":
 		s.ensureSizeArea(area, db, byteOffset+4)
 		buf := s.bufferForArea(area, db)
 		bits := math.Float32bits(float32(value))
@@ -730,12 +789,35 @@ func parseStateKey(raw string) (area string, db int, byteOffset int, bit int, er
 	return
 }
 
+func parseWordKey(raw string) (area string, db int, byteOffset int, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", 0, 0, fmt.Errorf("empty word key")
+	}
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "q:") {
+		area = "q"
+		raw = raw[2:]
+	} else {
+		area = "db"
+	}
+	if area == "q" {
+		byteOffset, err = strconv.Atoi(raw)
+		return
+	}
+	db, byteOffset, err = parseDBOffset(raw)
+	return
+}
+
 func registerLength(regType, dataType string) int {
 	regType = strings.ToLower(regType)
 	dataType = strings.ToUpper(dataType)
 
 	if regType == "dbx" || regType == "qx" || regType == "q" {
 		return 1
+	}
+	if regType == "dbd" || regType == "qdw" {
+		return 4
 	}
 
 	switch dataType {
