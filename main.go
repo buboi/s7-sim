@@ -332,11 +332,18 @@ func newSimulation(cfg Config, sample SampleData, listen string, port int) *Simu
 	return s
 }
 
-func (s *Simulation) start() error {
+func (s *Simulation) start() (err error) {
 	srv, err := NewS7Server()
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// On failure, release the SMART proxy listener and the Snap7 object.
+		if err != nil {
+			s.stopProxy()
+			srv.Destroy()
+		}
+	}()
 	listen, port := s.listen, s.port
 	if s.smart != nil {
 		if res := srv.SetPDURequest(smartPDU); res != 0 {
@@ -352,7 +359,6 @@ func (s *Simulation) start() error {
 	}
 	if port > 0 {
 		if res := srv.SetPort(uint16(port)); res != 0 {
-			s.stopProxy()
 			return fmt.Errorf("set port %d failed (code %d: %s)", port, res, srv.ErrorText(res))
 		}
 	}
@@ -382,7 +388,6 @@ func (s *Simulation) start() error {
 		res = srv.StartTo(listen)
 	}
 	if res != 0 {
-		s.stopProxy()
 		return fmt.Errorf("start server failed (code %d: %s)", res, srv.ErrorText(res))
 	}
 

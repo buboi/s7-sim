@@ -84,6 +84,13 @@ func TestSmartLayout(t *testing.T) {
 		t.Fatalf("layout: dbs=%v V=%d Q=%d", sim.dbNumbers(), len(sim.dbAreas[1]), len(sim.qArea))
 	}
 
+	// The full Q area exists even when the config uses no Q bits.
+	noQ := loadCSV(t, "[server],1,s7smart,127.0.0.1|0|1|102,0,1000\n[point],1,a,g/L,1,1|0,dbw,1,U16,1|10,1|12,1|14,1\n")
+	sim = newSimulation(noQ, SampleData{}, "", 0)
+	if err := sim.applySmartLayout(p); err != nil || len(sim.qArea) != smartIOSize {
+		t.Fatalf("no-Q config: Q=%d err=%v", len(sim.qArea), err)
+	}
+
 	// Too small V memory.
 	p, _ = newSmartProfile(2000, "0x0301")
 	if err := newSimulation(cfg, SampleData{}, "", 0).applySmartLayout(p); err == nil || !strings.Contains(err.Error(), "smart-vsize") {

@@ -71,6 +71,8 @@ What changes compared with the normal S7 mode:
 - **Memory layout.** V memory is the only data block, exposed as DB1 and sized by `-smart-vsize` (8192 bytes by default; set it to your CPU's V memory size). Reads past the end fail, as they do on the PLC. The CPU also has I and Q (128 bytes each) and M (32 bytes).
 - **Startup check.** Every address in the CSV, and every state/word key in the `-data` frames, must be in DB1 (for example `1|1002`, or `1:3000:0` in JSON) or in Q0–Q127. If not, the simulator refuses to start and lists what is wrong.
 
+`-db` replay works in SMART mode too, but the DB has to be recorded from a DB1 (SMART) config. A DB recorded from a normal S7 config, such as `topway-data0-s7-mes.db`, has columns like `1-dbw-10|0` that match no DB1 point, so the replay stops with "no DB column matches a [point]". To reuse such a DB, map its columns onto the DB1 points with a hand-written `-db-map` file.
+
 Snap7 itself accepts any TSAP, so in this mode a small proxy listens on the public port and checks the TSAP, while Snap7 runs on a private loopback port.
 
 ## Notes
