@@ -100,6 +100,25 @@ func inspectDB(w io.Writer, db *sql.DB, path string, schema *dbSchema, m *dbMapp
 			}
 		}
 		fmt.Fprintf(w, "%-16s rows=%-6d keys=%d mapped=%d\n", "settings_history", n, len(keys), mapped)
+		for _, col := range []string{"cv", "la", "ha", "lc", "hc"} {
+			if !schema.has("settings_history", col) {
+				fmt.Fprintf(w, "  %s: column missing (older collector DB)\n", col)
+				continue
+			}
+			var nn int
+			db.QueryRow(fmt.Sprintf("SELECT count(%s) FROM settings_history", col)).Scan(&nn)
+			addr := 0
+			for _, p := range m.cfg.Points {
+				if setpointDB(p, col) > 0 {
+					addr++
+				}
+			}
+			note := ""
+			if nn > 0 && addr == 0 {
+				note = "  (values recorded but no point has this address in the config)"
+			}
+			fmt.Fprintf(w, "  %s: %d non-null values, %d config points with an address%s\n", col, nn, addr, note)
+		}
 		for _, k := range bad {
 			fmt.Fprintf(w, "  unmapped %s: %s\n", k, m.unmapped[k])
 		}
@@ -253,4 +272,21 @@ func rowIntervals(db *sql.DB, table string, maxGap time.Duration) (time.Duration
 	}
 	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
 	return ds[len(ds)/2], gaps, rows.Err()
+}
+
+// setpointDB returns the configured DB for a setpoint kind, 0 if none.
+func setpointDB(p PointDef, kind string) int {
+	switch kind {
+	case "cv":
+		return p.ControlDB
+	case "la":
+		return p.LowDB
+	case "ha":
+		return p.HighDB
+	case "lc":
+		return p.LCDB
+	case "hc":
+		return p.HCDB
+	}
+	return 0
 }

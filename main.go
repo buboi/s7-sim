@@ -48,6 +48,10 @@ type PointDef struct {
 	LowOff       int
 	HighDB       int
 	HighOff      int
+	LCDB         int // control low (控制下限值偏移)
+	LCOff        int
+	HCDB         int // control high (控制上限值偏移)
+	HCOff        int
 }
 
 // AlarmDef maps a single alarm bit.
@@ -105,6 +109,8 @@ type Frame struct {
 	CV     map[string]float64 `json:"cv"`
 	LA     map[string]float64 `json:"la"`
 	HA     map[string]float64 `json:"ha"`
+	LC     map[string]float64 `json:"lc"`
+	HC     map[string]float64 `json:"hc"`
 	Words  map[string]float64 `json:"words"`
 	Dosing map[string]float64 `json:"dosing"`
 	Alarms []string           `json:"alarms"`
@@ -222,6 +228,9 @@ func main() {
 			*dataPath, sample.IntervalMS, len(sample.Frames), firstFrame.Name,
 			len(firstFrame.States), len(firstFrame.Points), len(firstFrame.CV),
 			len(firstFrame.LA), len(firstFrame.HA), len(firstFrame.Dosing), len(firstFrame.Alarms))
+		if len(firstFrame.LC)+len(firstFrame.HC) > 0 {
+			log.Printf("first frame also sets lc=%d hc=%d", len(firstFrame.LC), len(firstFrame.HC))
+		}
 		src = newJSONSource(sample)
 	}
 	defer src.Close()
@@ -358,6 +367,12 @@ func (s *Simulation) ensureDBLayout() {
 		}
 		if p.HighDB > 0 {
 			s.ensureSize(p.HighDB, p.HighOff+registerLength(p.RegisterType, p.DataType))
+		}
+		if p.LCDB > 0 {
+			s.ensureSize(p.LCDB, p.LCOff+registerLength(p.RegisterType, p.DataType))
+		}
+		if p.HCDB > 0 {
+			s.ensureSize(p.HCDB, p.HCOff+registerLength(p.RegisterType, p.DataType))
 		}
 	}
 	for _, a := range s.cfg.Alarms {
@@ -509,43 +524,13 @@ func (s *Simulation) applyFrame(frame Frame) {
 		s.writeValue(area, def.DB, def.ByteOffset, def.RegisterType, def.DataType, raw)
 	}
 
-	// Control value (CV), low alarm (LA), high alarm (HA) writing to offsets in DB20.
-	for key, val := range frame.CV {
-		def, ok := s.cfg.pointByKey[key]
-		if !ok || def.ControlDB == 0 {
-			if !ok {
-				log.Printf("unknown cv point %q in frame %s", key, frame.Name)
-			}
-			continue
-		}
-		raw := val * float64(def.Multiplier)
-		area := areaFromRegType(def.RegisterType)
-		s.writeValue(area, def.ControlDB, def.ControlOff, def.RegisterType, def.DataType, raw)
-	}
-	for key, val := range frame.LA {
-		def, ok := s.cfg.pointByKey[key]
-		if !ok || def.LowDB == 0 {
-			if !ok {
-				log.Printf("unknown la point %q in frame %s", key, frame.Name)
-			}
-			continue
-		}
-		raw := val * float64(def.Multiplier)
-		area := areaFromRegType(def.RegisterType)
-		s.writeValue(area, def.LowDB, def.LowOff, def.RegisterType, def.DataType, raw)
-	}
-	for key, val := range frame.HA {
-		def, ok := s.cfg.pointByKey[key]
-		if !ok || def.HighDB == 0 {
-			if !ok {
-				log.Printf("unknown ha point %q in frame %s", key, frame.Name)
-			}
-			continue
-		}
-		raw := val * float64(def.Multiplier)
-		area := areaFromRegType(def.RegisterType)
-		s.writeValue(area, def.HighDB, def.HighOff, def.RegisterType, def.DataType, raw)
-	}
+	// Setpoints: control value (CV), low/high alarm (LA/HA) and control
+	// low/high (LC/HC), written to the offsets configured on the point.
+	s.writeSetpoints(frame.Name, "cv", frame.CV, func(p PointDef) (int, int) { return p.ControlDB, p.ControlOff })
+	s.writeSetpoints(frame.Name, "la", frame.LA, func(p PointDef) (int, int) { return p.LowDB, p.LowOff })
+	s.writeSetpoints(frame.Name, "ha", frame.HA, func(p PointDef) (int, int) { return p.HighDB, p.HighOff })
+	s.writeSetpoints(frame.Name, "lc", frame.LC, func(p PointDef) (int, int) { return p.LCDB, p.LCOff })
+	s.writeSetpoints(frame.Name, "hc", frame.HC, func(p PointDef) (int, int) { return p.HCDB, p.HCOff })
 
 	// Alarms: clear all first, then set the ones listed for this frame.
 	if !frame.KeepAlarms {
@@ -563,6 +548,27 @@ func (s *Simulation) applyFrame(frame Frame) {
 	}
 
 	// log.Printf("applied frame %q", frame.Name)
+}
+
+// writeSetpoints writes point-keyed setpoint values to the address chosen by target.
+// Points without a configured address for this setpoint are skipped.
+func (s *Simulation) writeSetpoints(frameName, kind string, values map[string]float64, target func(PointDef) (int, int)) {
+	for key, val := range values {
+		def, ok := s.cfg.pointByKey[key]
+		if !ok {
+			log.Printf("unknown %s point %q in frame %s", kind, key, frameName)
+			continue
+		}
+		db, off := target(def)
+		if db == 0 {
+			continue
+		}
+		mult := def.Multiplier
+		if mult == 0 {
+			mult = 1
+		}
+		s.writeValue(areaFromRegType(def.RegisterType), db, off, def.RegisterType, def.DataType, val*float64(mult))
+	}
 }
 
 func (s *Simulation) writeValue(area string, db, byteOffset int, regType, dataType string, value float64) {
@@ -584,22 +590,22 @@ func (s *Simulation) writeValue(area string, db, byteOffset int, regType, dataTy
 		}
 		s.ensureSizeArea(area, db, byteOffset+2)
 		buf := s.bufferForArea(area, db)
-		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(value))
+		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(math.Round(value)))
 	case "S16", "INT":
 		s.ensureSizeArea(area, db, byteOffset+2)
 		buf := s.bufferForArea(area, db)
-		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(int16(value)))
+		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(int16(math.Round(value))))
 	case "U32", "DINT":
 		if value < 0 {
 			value = 0
 		}
 		s.ensureSizeArea(area, db, byteOffset+4)
 		buf := s.bufferForArea(area, db)
-		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(value))
+		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(math.Round(value)))
 	case "S32":
 		s.ensureSizeArea(area, db, byteOffset+4)
 		buf := s.bufferForArea(area, db)
-		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(int32(value)))
+		binary.BigEndian.PutUint32(buf[byteOffset:], uint32(int32(math.Round(value))))
 	case "REAL", "FLOAT", "F32":
 		s.ensureSizeArea(area, db, byteOffset+4)
 		buf := s.bufferForArea(area, db)
@@ -609,7 +615,7 @@ func (s *Simulation) writeValue(area string, db, byteOffset int, regType, dataTy
 		// Default to 16-bit unsigned for unknown entries.
 		s.ensureSizeArea(area, db, byteOffset+2)
 		buf := s.bufferForArea(area, db)
-		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(value))
+		binary.BigEndian.PutUint16(buf[byteOffset:], uint16(math.Round(value)))
 	}
 }
 
@@ -689,6 +695,8 @@ func loadConfig(path string) (Config, error) {
 			ctrlDB, ctrlOff, _ := parseDBOffset(rec[9])
 			lowDB, lowOff, _ := parseDBOffset(rec[10])
 			highDB, highOff, _ := parseDBOffset(rec[11])
+			lcDB, lcOff, _ := parseDBOffset(field(rec, 18))
+			hcDB, hcOff, _ := parseDBOffset(field(rec, 19))
 			key := fmt.Sprintf("%d:%s", tankID, name)
 			def := PointDef{
 				Key:          key,
@@ -707,6 +715,10 @@ func loadConfig(path string) (Config, error) {
 				LowOff:       lowOff,
 				HighDB:       highDB,
 				HighOff:      highOff,
+				LCDB:         lcDB,
+				LCOff:        lcOff,
+				HCDB:         hcDB,
+				HCOff:        hcOff,
 			}
 			cfg.Points = append(cfg.Points, def)
 			cfg.pointByKey[key] = def
@@ -904,6 +916,14 @@ func areaFromRegType(regType string) string {
 	default:
 		return "db"
 	}
+}
+
+// field returns rec[i], or "" when the row is shorter.
+func field(rec []string, i int) string {
+	if i < len(rec) {
+		return rec[i]
+	}
+	return ""
 }
 
 func defaultStr(v, fallback string) string {

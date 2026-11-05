@@ -46,6 +46,7 @@ type dbEvent struct {
 	points     map[string]float64 // evData: point key -> value (scaled)
 	key        string             // evSettings: point key
 	cv, la, ha sql.NullFloat64
+	lc, hc     sql.NullFloat64
 	alarm      AlarmDef
 	dose       DosingDef
 	amount     float64
@@ -298,14 +299,31 @@ func (s *sqliteSource) buildCursors() []*cursor {
 			}})
 	}
 	if s.schema.has("settings_history", "timestamp", "data_address", "cv", "ha", "la") {
-		cs = append(cs, &cursor{db: s.db, table: "settings_history", cols: []string{"data_address", "cv", "la", "ha"}, pageSize: s.opt.PageSize,
+		// hc/lc were added to the collector later; select them only when present.
+		cols := []string{"data_address", "cv", "la", "ha"}
+		hasLC, hasHC := s.schema.has("settings_history", "lc"), s.schema.has("settings_history", "hc")
+		if hasLC {
+			cols = append(cols, "lc")
+		}
+		if hasHC {
+			cols = append(cols, "hc")
+		}
+		cs = append(cs, &cursor{db: s.db, table: "settings_history", cols: cols, pageSize: s.opt.PageSize,
 			conv: func(ts time.Time, vals []any) (dbEvent, bool) {
 				t, ok := m.point(toString(vals[0]))
 				if !ok {
 					return dbEvent{}, false
 				}
 				ev := dbEvent{t: ts, kind: evSettings, key: t.def.Key, cv: nullFloat(vals[1]), la: nullFloat(vals[2]), ha: nullFloat(vals[3])}
-				for _, f := range []*sql.NullFloat64{&ev.cv, &ev.la, &ev.ha} {
+				i := 4
+				if hasLC {
+					ev.lc = nullFloat(vals[i])
+					i++
+				}
+				if hasHC {
+					ev.hc = nullFloat(vals[i])
+				}
+				for _, f := range []*sql.NullFloat64{&ev.cv, &ev.la, &ev.ha, &ev.lc, &ev.hc} {
 					f.Float64 *= t.scale
 				}
 				return ev, true
@@ -442,10 +460,8 @@ func (s *sqliteSource) planStep() error {
 		log.Printf("replay: step %d source time %s", s.steps, t.Format("2006-01-02 15:04:05.000"))
 	}
 
-	pre := Frame{Points: map[string]float64{}, CV: map[string]float64{}, LA: map[string]float64{}, HA: map[string]float64{},
-		Dosing: map[string]float64{}, States: map[string]int{}}
-	at := Frame{Points: map[string]float64{}, CV: map[string]float64{}, LA: map[string]float64{}, HA: map[string]float64{},
-		Dosing: map[string]float64{}, States: map[string]int{}}
+	pre := newReplayFrame()
+	at := newReplayFrame()
 
 	raised := map[string]bool{}
 	for _, ev := range s.peeked {
@@ -463,6 +479,12 @@ func (s *sqliteSource) planStep() error {
 			}
 			if ev.ha.Valid {
 				dst.HA[ev.key] = ev.ha.Float64
+			}
+			if ev.lc.Valid {
+				dst.LC[ev.key] = ev.lc.Float64
+			}
+			if ev.hc.Valid {
+				dst.HC[ev.key] = ev.hc.Float64
 			}
 		case evData:
 			trigs := s.mapping.triggers[ev.tank]
@@ -553,8 +575,7 @@ func (s *sqliteSource) Next() (Frame, time.Duration, error) {
 		}
 	}
 
-	f := Frame{Name: "sqlite", KeepAlarms: true, Points: map[string]float64{}, CV: map[string]float64{}, LA: map[string]float64{},
-		HA: map[string]float64{}, Dosing: map[string]float64{}, States: map[string]int{}}
+	f := newReplayFrame()
 	at := s.actions[0].at
 	for s.actions.Len() > 0 && s.actions[0].at == at {
 		a := heap.Pop(&s.actions).(*action)
@@ -592,28 +613,23 @@ func invertBit(v int) int {
 }
 
 func frameEmpty(f Frame) bool {
-	return len(f.Points)+len(f.CV)+len(f.LA)+len(f.HA)+len(f.Dosing)+len(f.States) == 0
+	return len(f.Points)+len(f.CV)+len(f.LA)+len(f.HA)+len(f.LC)+len(f.HC)+len(f.Dosing)+len(f.States) == 0
+}
+
+func newReplayFrame() Frame {
+	return Frame{Name: "sqlite", KeepAlarms: true, Points: map[string]float64{}, CV: map[string]float64{},
+		LA: map[string]float64{}, HA: map[string]float64{}, LC: map[string]float64{}, HC: map[string]float64{},
+		Dosing: map[string]float64{}, States: map[string]int{}}
 }
 
 func mergeFrame(dst *Frame, src Frame) {
-	for k, v := range src.Points {
-		dst.Points[k] = v
+	for _, pair := range [][2]map[string]float64{
+		{dst.Points, src.Points}, {dst.CV, src.CV}, {dst.LA, src.LA}, {dst.HA, src.HA},
+		{dst.LC, src.LC}, {dst.HC, src.HC}, {dst.Dosing, src.Dosing},
+	} {
+		maps.Copy(pair[0], pair[1])
 	}
-	for k, v := range src.CV {
-		dst.CV[k] = v
-	}
-	for k, v := range src.LA {
-		dst.LA[k] = v
-	}
-	for k, v := range src.HA {
-		dst.HA[k] = v
-	}
-	for k, v := range src.Dosing {
-		dst.Dosing[k] = v
-	}
-	for k, v := range src.States {
-		dst.States[k] = v
-	}
+	maps.Copy(dst.States, src.States)
 }
 
 // sourceStats summarises cursor problems (for logs).

@@ -32,6 +32,7 @@ Flags:
 
 - `states`: map of `DB:BYTE:BIT` to 0/1 for DB30 bits.
 - `points`: map of `<tankId>:<pointName>` to engineering values; code multiplies by the CSV multiplier before writing WORDs.
+- `cv`, `la`, `ha`, `lc`, `hc`: map of `<tankId>:<pointName>` to setpoint values (control value, low/high alarm, control low/high). They are written to the point's 控制值/下限值/上限值/控制下限值/控制上限值 offsets, with the point's multiplier and type.
 - `alarms`: list of alarm text from the CSV to raise in that frame. All other alarms are cleared before applying the listed ones.
 
 Frames rotate every `interval_ms` (default 2000ms). Adjust the JSON or add more frames to simulate different behaviors.
@@ -48,7 +49,7 @@ go run . -config topway-data0-s7.csv -db topway-data0-s7-mes.db -db-inspect
 go run . -config topway-data0-s7.csv -db topway-data0-s7-mes.db -port 1102
 ```
 
-- DB columns such as `1-dbw-10|0` are matched to `[point]` rows by tank and address. `settings_history` drives CV/LA/HA, `alarms` raise alarm bits, and `dosing_records` write dosing amounts.
+- DB columns such as `1-dbw-10|0` are matched to `[point]` rows by tank and address. `settings_history` drives CV/LA/HA/LC/HC, `alarms` raise alarm bits, and `dosing_records` write dosing amounts.
 - With `-pulse` (on by default), `[state-trigger]` and dosing Q bits rise about 1 s before each recorded time and fall at it. Alarm bits rise at the recorded time and clear within `-alarm-hold` (5s). A collector pointed at the simulator re-records the same data.
 - Useful flags: `-speed 4`, `-replay fixed -interval 1s`, `-db-from/-db-to "2026-07-16 17:05:00"`, `-max-gap 10s`, `-loop=false`, `-db-map overrides.json`.
 - Design: [docs/design/sqlite-replay-mode.md](docs/design/sqlite-replay-mode.md).

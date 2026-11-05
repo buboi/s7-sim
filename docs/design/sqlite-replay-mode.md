@@ -114,7 +114,7 @@ treat `:` and `|` as the same character.
 | DB entity | Config target |
 |---|---|
 | column `T-reg-DB\|off` | `PointDef` with `TankID==T`, `RegisterType==reg`, `DB==DB`, `ByteOffset==off` |
-| settings `data_address` | that point's `ControlDB/Off`, `LowDB/Off`, `HighDB/Off` (`cv`/`la`/`ha`). `hc`/`lc` are ignored, see §11. |
+| settings `data_address` | that point's `ControlDB/Off`, `LowDB/Off`, `HighDB/Off`, `LCDB/Off`, `HCDB/Off` (`cv`/`la`/`ha`/`lc`/`hc`). `lc`/`hc` are read only when the columns exist (older DBs lack them). |
 | alarm `reg-DB\|off` + bit | `AlarmDef` with the same DB/offset/bit. Fallback: an exact match on `message`. |
 | dosing `tank_id` + `name` | `DosingDef` (`cfg.doseByName` is keyed by name, so it becomes tank+name) plus the related `[state-dosing]` Q bit. Fallback: trigger address + bit. |
 
@@ -186,7 +186,7 @@ same timestamp form one **step**.
 
 For each step at time `t`, build a `Frame` and call `applyFrame`:
 
-1. `Settings` → `CV/LA/HA`. Only values that changed are written.
+1. `Settings` → `CV/LA/HA/LC/HC`. NULL values are skipped.
 2. `DataRow` → `Points`. A NULL keeps the previous value. A row whose values
    are all NULL is still kept, because it still marks a trigger edge.
 3. `Dose` → `Dosing` amount (written to `加药量地址`), then the Q bit edge (§7.3).
@@ -280,7 +280,8 @@ because cgo is already in use, but its first build is slower.
 1. **Alarm duration:** each raise is held until just before the next raise of
    the same alarm, at most 5 s (`-alarm-hold`, default 5s). This also applies
    with `-pulse=false`, so alarms never stay latched on.
-2. **`hc`/`lc`:** skipped. They carry no useful information for the simulator.
+2. **`hc`/`lc`:** first skipped, then **added on 2026-11-05**, because the
+   collector reads HC/LC from the PLC. See §12.
 3. **Default replay mode:** `realtime` at 1×.
 4. **`-pulse`:** on by default.
 
@@ -300,3 +301,23 @@ because cgo is already in use, but its first build is slower.
   replay of `topway-data0-s7-mes.db`. It re-recorded 15/15/15 rows for tanks
   1/3/6, 15 alarms and 10 dosing records. The values were identical, and the
   spacing matched the source within one poll cycle.
+- **HC/LC (control high/low) support:**
+  - `[point]` columns 18 and 19 (`控制下限值偏移` = LC, `控制上限值偏移` = HC)
+    are now parsed into `PointDef.LCDB/LCOff` and `HCDB/HCOff`. This matches
+    `data_collector_new`, which reads them with the point's data type and
+    multiplier.
+  - JSON frames accept `"lc"` / `"hc"` maps, which work like `"la"` / `"ha"`.
+  - Replay writes `settings_history.lc/hc`. `-db-inspect` shows how many values
+    are non-null for each setpoint column, and how many config points have an
+    address for it.
+  - Round-trip check: a config with LC/HC at DB20.DBW108/110 and a DB with
+    lc = 1.2 / hc = 3.2 gave DBW108 = 120 and DBW110 = 320, and the collector
+    re-recorded lc = 1.2 / hc = 3.2.
+- **Integer writes now round.** `writeValue` used to truncate when converting
+  to an integer (U16/S16/U32/S32). So `8.45 × 100 = 844.999…` was stored as
+  844 and read back as 8.44. It now uses `math.Round`. This affects every
+  integer-typed value, in both JSON and SQLite mode.
+- Verified on 2026-11-05: a round trip with LC/HC configured on all 13 setpoint
+  points and distinct CV/LA/HA/LC/HC values returned every one of the 78
+  recorded rows. The only differences were values that a U16 with
+  multiplier 1 cannot represent (e.g. `80.05` → `80`), which is expected.
