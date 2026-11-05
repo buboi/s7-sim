@@ -22,8 +22,9 @@ import (
 
 // ServerDef describes the PLC endpoint we emulate.
 type ServerDef struct {
-    ID      int
-    Address string
+    ID       int
+    Protocol string // "s7" or "s7smart"
+    Address  string
     Rack    int
     Slot    int
     Port    int
@@ -130,6 +131,8 @@ type Simulation struct {
 	qArea     []byte
 	dbMu      sync.Mutex
 	srv       *S7Server
+	smart     *smartProfile // non-nil when emulating an S7-200 SMART CPU
+	proxy     *tsapProxy
 	listen    string
 	port      int
 	stopCh    chan struct{}
@@ -155,6 +158,9 @@ func main() {
 	pulse := flag.Bool("pulse", true, "drive trigger/dosing bits as edges so a downstream collector records the replay")
 	pulseLead := flag.Duration("pulse-lead", 0, "how long trigger/dosing bits are high before the recorded time (default max(1s, cycle))")
 	alarmHold := flag.Duration("alarm-hold", 5*time.Second, "maximum time an alarm bit stays on after a raise")
+	smartFlag := flag.Bool("smart", false, "emulate an S7-200 SMART CPU (default: on when the CSV [server] protocol is s7smart)")
+	smartVSize := flag.Int("smart-vsize", defaultSmartVSize, "S7-200 SMART V memory (DB1) size in bytes; set it to your CPU's V size")
+	smartTSAP := flag.String("smart-tsap", "0x0301", "remote TSAP an S7-200 SMART accepts (\"any\" to accept every TSAP)")
 	flag.Parse()
 
 	dataSet := false
@@ -248,7 +254,31 @@ func main() {
 		}
 	}
 
+	smartSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "smart" {
+			smartSet = true
+		}
+	})
+	useSmart := cfg.Server.Protocol == "s7smart"
+	if smartSet {
+		useSmart = *smartFlag
+	}
+	var smart *smartProfile
+	if useSmart {
+		if smart, err = newSmartProfile(*smartVSize, *smartTSAP); err != nil {
+			log.Fatalf("smart mode: %v", err)
+		}
+	}
+
 	sim := newSimulation(cfg, sample, listenAddr, portNum)
+	if smart != nil {
+		if err := sim.applySmartLayout(smart); err != nil {
+			log.Fatalf("config is not valid for an S7-200 SMART: %v", err)
+		}
+		log.Printf("S7-200 SMART mode: V memory=DB1 (%d bytes), I/Q %d bytes, M %d bytes, PDU %d, remote TSAP %s",
+			smart.VSize, smartIOSize, smartMSize, smartPDU, smart.tsapText())
+	}
 	if err := sim.start(); err != nil {
 		log.Fatalf("failed to start S7 server: %v", err)
 	}
@@ -307,9 +337,23 @@ func (s *Simulation) start() error {
 	if err != nil {
 		return err
 	}
-	if s.port > 0 {
-		if res := srv.SetPort(uint16(s.port)); res != 0 {
-			return fmt.Errorf("set port %d failed (code %d: %s)", s.port, res, srv.ErrorText(res))
+	listen, port := s.listen, s.port
+	if s.smart != nil {
+		if res := srv.SetPDURequest(smartPDU); res != 0 {
+			return fmt.Errorf("set PDU size failed (code %d: %s)", res, srv.ErrorText(res))
+		}
+		if s.smart.CheckTSAP {
+			// Snap7 accepts any TSAP, so a front proxy filters connection
+			// requests and Snap7 itself listens on a private loopback port.
+			if listen, port, err = s.startTSAPProxy(); err != nil {
+				return err
+			}
+		}
+	}
+	if port > 0 {
+		if res := srv.SetPort(uint16(port)); res != 0 {
+			s.stopProxy()
+			return fmt.Errorf("set port %d failed (code %d: %s)", port, res, srv.ErrorText(res))
 		}
 	}
 	for dbNum, buf := range s.dbAreas {
@@ -322,14 +366,23 @@ func (s *Simulation) start() error {
 			return fmt.Errorf("register Q area failed (code %d)", res)
 		}
 	}
+	if s.smart != nil {
+		if res := srv.RegisterArea(srvAreaPE, 0, s.smart.I); res != 0 {
+			return fmt.Errorf("register I area failed (code %d)", res)
+		}
+		if res := srv.RegisterArea(srvAreaMK, 0, s.smart.M); res != 0 {
+			return fmt.Errorf("register M area failed (code %d)", res)
+		}
+	}
 
 	var res int
-	if s.listen == "" {
+	if listen == "" {
 		res = srv.Start()
 	} else {
-		res = srv.StartTo(s.listen)
+		res = srv.StartTo(listen)
 	}
 	if res != 0 {
+		s.stopProxy()
 		return fmt.Errorf("start server failed (code %d: %s)", res, srv.ErrorText(res))
 	}
 
@@ -339,6 +392,7 @@ func (s *Simulation) start() error {
 
 func (s *Simulation) stop() {
 	close(s.stopCh)
+	s.stopProxy()
 	if s.srv != nil {
 		_ = s.srv.Stop()
 		s.srv.Destroy()
@@ -679,7 +733,7 @@ func loadConfig(path string) (Config, error) {
             id, _ := strconv.Atoi(rec[1])
             addr, rack, slot, port := parseAddress(rec[3])
             cycle, _ := strconv.Atoi(rec[5])
-            cfg.Server = ServerDef{ID: id, Address: addr, Rack: rack, Slot: slot, Cycle: time.Duration(cycle) * time.Millisecond, Port: port}
+            cfg.Server = ServerDef{ID: id, Protocol: strings.ToLower(strings.TrimSpace(rec[2])), Address: addr, Rack: rack, Slot: slot, Cycle: time.Duration(cycle) * time.Millisecond, Port: port}
 		case "[point]":
 			if len(rec) < 10 {
 				continue

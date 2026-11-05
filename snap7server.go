@@ -24,7 +24,8 @@ const (
 
 // server param numbers (see snap7.h p_u16_LocalPort, ...).
 const (
-    paramLocalPort = 1
+    paramLocalPort  = 1
+    paramPDURequest = 10
 )
 
 // S7Server is a light wrapper around Snap7 S7Object-based server.
@@ -78,4 +79,9 @@ func (s *S7Server) SetParam(param int, value unsafe.Pointer) int {
 // SetPort updates the listening port before Start/StartTo.
 func (s *S7Server) SetPort(port uint16) int {
     return s.SetParam(paramLocalPort, unsafe.Pointer(&port))
+}
+
+// SetPDURequest sets the largest PDU the server accepts during negotiation.
+func (s *S7Server) SetPDURequest(size int32) int {
+    return s.SetParam(paramPDURequest, unsafe.Pointer(&size))
 }
