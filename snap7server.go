@@ -1,6 +1,7 @@
 package main
 
 /*
+#cgo CFLAGS: -std=gnu17
 #cgo LDFLAGS: -lsnap7
 #include <stdlib.h>
 #include <snap7.h>

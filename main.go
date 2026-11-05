@@ -62,12 +62,15 @@ type AlarmDef struct {
 
 // StateDef describes a state bit we may toggle.
 type StateDef struct {
-	ServerID   int
-	DB         int
-	ByteOffset int
-	Bit        int
-	Value      int
-	Area       string
+	ServerID     int
+	DB           int
+	ByteOffset   int
+	Bit          int
+	Value        int
+	Area         string
+	RegisterType string
+	Kind         string // "trigger" or "dosing"
+	TankID       int
 }
 
 // DosingDef maps a dosing chemical name to a DB/offset for amount.
@@ -79,6 +82,7 @@ type DosingDef struct {
 	RegisterType string
 	Multiplier   int
 	DataType     string
+	Trigger      *StateDef // Q bit that signals this dosing event
 }
 
 type Config struct {
@@ -104,6 +108,8 @@ type Frame struct {
 	Words  map[string]float64 `json:"words"`
 	Dosing map[string]float64 `json:"dosing"`
 	Alarms []string           `json:"alarms"`
+	// KeepAlarms skips the "clear all alarms" step; alarm bits are then driven via States.
+	KeepAlarms bool `json:"-"`
 }
 
 type SampleData struct {
@@ -126,10 +132,34 @@ type Simulation struct {
 
 func main() {
 	configPath := flag.String("config", "topway-data0-s7.csv", "path to the CSV configuration")
-	dataPath := flag.String("data", filepath.Join("simdata", "sample_values.json"), "path to the simulation values file")
-    listen := flag.String("listen", "0.0.0.0", "IP address to bind the S7 server to (use empty to let Snap7 choose)")
-    port := flag.Int("port", 0, "TCP port to listen on (default from CSV; fallback 1102 if none)")
-    flag.Parse()
+	dataPath := flag.String("data", filepath.Join("simdata", "sample_values.json"), "path to the simulation values file (JSON mode)")
+	listen := flag.String("listen", "0.0.0.0", "IP address to bind the S7 server to (use empty to let Snap7 choose)")
+	port := flag.Int("port", 0, "TCP port to listen on (default from CSV; fallback 1102 if none)")
+
+	dbPath := flag.String("db", "", "replay a data_collector SQLite DB instead of -data")
+	dbInspect := flag.Bool("db-inspect", false, "print the DB schema/mapping report and exit")
+	dbMapPath := flag.String("db-map", "", "optional JSON file with key overrides for -db")
+	dbFrom := flag.String("db-from", "", "replay window start (RFC3339 or 2006-01-02 15:04:05, local time)")
+	dbTo := flag.String("db-to", "", "replay window end (exclusive)")
+	replayMode := flag.String("replay", "realtime", "realtime (original gaps) or fixed (one step per -interval)")
+	speed := flag.Float64("speed", 1.0, "replay speed multiplier in realtime mode")
+	interval := flag.Duration("interval", time.Second, "step length in fixed mode")
+	maxGap := flag.Duration("max-gap", 10*time.Second, "cap for gaps between source events")
+	loop := flag.Bool("loop", true, "restart from the beginning after the last event")
+	pulse := flag.Bool("pulse", true, "drive trigger/dosing bits as edges so a downstream collector records the replay")
+	pulseLead := flag.Duration("pulse-lead", 0, "how long trigger/dosing bits are high before the recorded time (default max(1s, cycle))")
+	alarmHold := flag.Duration("alarm-hold", 5*time.Second, "maximum time an alarm bit stays on after a raise")
+	flag.Parse()
+
+	dataSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "data" {
+			dataSet = true
+		}
+	})
+	if *dbPath != "" && dataSet {
+		log.Fatalf("-db and -data are mutually exclusive")
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -138,89 +168,104 @@ func main() {
 	log.Printf("loaded config %s (server=%s rack=%d slot=%d port=%d points=%d alarms=%d states=%d dosing=%d)",
 		*configPath, cfg.Server.Address, cfg.Server.Rack, cfg.Server.Slot, cfg.Server.Port,
 		len(cfg.Points), len(cfg.Alarms), len(cfg.States), len(cfg.Dosing))
-	if len(cfg.Points) > 0 {
-		p := cfg.Points[0]
-		log.Printf("first point: tank=%d name=%q db=%d byte=%d reg=%s mult=%d type=%s cv=%d|%d la=%d|%d ha=%d|%d",
-			p.TankID, p.Name, p.DB, p.ByteOffset, p.RegisterType, p.Multiplier, p.DataType,
-			p.ControlDB, p.ControlOff, p.LowDB, p.LowOff, p.HighDB, p.HighOff)
+
+	var src FrameSource
+	sample := SampleData{}
+	if *dbPath != "" {
+		lead := *pulseLead
+		if lead <= 0 {
+			lead = time.Second
+			if cfg.Server.Cycle > lead {
+				lead = cfg.Server.Cycle
+			}
+		}
+		opt := replayOptions{
+			Realtime:  *replayMode != "fixed",
+			Speed:     *speed,
+			Interval:  *interval,
+			MaxGap:    *maxGap,
+			Loop:      *loop,
+			Pulse:     *pulse,
+			PulseLead: lead,
+			AlarmHold: *alarmHold,
+			LogEvery:  100,
+		}
+		if *replayMode != "fixed" && *replayMode != "realtime" {
+			log.Fatalf("-replay must be realtime or fixed")
+		}
+		if opt.From, err = parseUserTime(*dbFrom); err != nil {
+			log.Fatal(err)
+		}
+		if opt.To, err = parseUserTime(*dbTo); err != nil {
+			log.Fatal(err)
+		}
+		src, err = openSQLiteSource(*dbPath, *dbMapPath, &cfg, opt, *dbInspect)
+		if err != nil {
+			log.Fatalf("sqlite replay: %v", err)
+		}
+		if src == nil { // inspect only
+			return
+		}
+	} else {
+		if *dbInspect {
+			log.Fatalf("-db-inspect requires -db")
+		}
+		sample, err = loadSampleData(*dataPath)
+		if err != nil {
+			log.Fatalf("failed to load sample data: %v", err)
+		}
+		if len(sample.Frames) == 0 {
+			log.Fatalf("sample data %s contains no frames", *dataPath)
+		}
+		firstFrame := sample.Frames[0]
+		log.Printf("loaded sample %s (interval_ms=%d frames=%d first=%q states=%d points=%d cv=%d la=%d ha=%d dosing=%d alarms=%d)",
+			*dataPath, sample.IntervalMS, len(sample.Frames), firstFrame.Name,
+			len(firstFrame.States), len(firstFrame.Points), len(firstFrame.CV),
+			len(firstFrame.LA), len(firstFrame.HA), len(firstFrame.Dosing), len(firstFrame.Alarms))
+		src = newJSONSource(sample)
 	}
-	if len(cfg.States) > 0 {
-		st := cfg.States[0]
-		log.Printf("first state: area=%s db=%d byte=%d bit=%d value=%d",
-			st.Area, st.DB, st.ByteOffset, st.Bit, st.Value)
+	defer src.Close()
+
+	listenAddr := *listen
+	if listenAddr == "" {
+		listenAddr = cfg.Server.Address
 	}
-	if len(cfg.Dosing) > 0 {
-		d := cfg.Dosing[0]
-		log.Printf("first dosing: tank=%d name=%q db=%d byte=%d reg=%s mult=%d type=%s",
-			d.TankID, d.Name, d.DB, d.ByteOffset, d.RegisterType, d.Multiplier, d.DataType)
+	portNum := *port
+	if portNum == 0 {
+		if cfg.Server.Port > 0 {
+			portNum = cfg.Server.Port
+		} else {
+			portNum = 1102
+		}
 	}
 
-	sample, err := loadSampleData(*dataPath)
-	if err != nil {
-		log.Fatalf("failed to load sample data: %v", err)
-	}
-	if len(sample.Frames) == 0 {
-		log.Fatalf("sample data %s contains no frames", *dataPath)
-	}
-	firstFrame := sample.Frames[0]
-	log.Printf("loaded sample %s (interval_ms=%d frames=%d first=%q states=%d points=%d cv=%d la=%d ha=%d dosing=%d alarms=%d)",
-		*dataPath, sample.IntervalMS, len(sample.Frames), firstFrame.Name,
-		len(firstFrame.States), len(firstFrame.Points), len(firstFrame.CV),
-		len(firstFrame.LA), len(firstFrame.HA), len(firstFrame.Dosing), len(firstFrame.Alarms))
-	for key, val := range firstFrame.Points {
-		log.Printf("first sample point: %s=%.3f", key, val)
-		break
-	}
-	for key, val := range firstFrame.States {
-		log.Printf("first sample state: %s=%d", key, val)
-		break
-	}
-	for key, val := range firstFrame.Dosing {
-		log.Printf("first sample dosing: %s=%.3f", key, val)
-		break
-	}
-
-    listenAddr := *listen
-    if listenAddr == "" {
-        listenAddr = cfg.Server.Address
-    }
-    portNum := *port
-    if portNum == 0 {
-        if cfg.Server.Port > 0 {
-            portNum = cfg.Server.Port
-        } else {
-            portNum = 1102
-        }
-    }
-
-    sim := newSimulation(cfg, sample, listenAddr, portNum)
+	sim := newSimulation(cfg, sample, listenAddr, portNum)
 	if err := sim.start(); err != nil {
 		log.Fatalf("failed to start S7 server: %v", err)
 	}
 	defer sim.stop()
 
-	log.Printf("server is ready on %s (DBs: %v)", listenAddr, sim.dbNumbers())
-
-	interval := sample.IntervalMS
-	if interval == 0 {
-		interval = 2000
-	}
-
-	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
-	defer ticker.Stop()
-
-	frameIdx := 0
-	sim.applyFrame(sample.Frames[frameIdx])
-	frameIdx = (frameIdx + 1) % len(sample.Frames)
+	log.Printf("server is ready on %s:%d (DBs: %v)", listenAddr, portNum, sim.dbNumbers())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
-			sim.applyFrame(sample.Frames[frameIdx])
-			frameIdx = (frameIdx + 1) % len(sample.Frames)
+		case <-timer.C:
+			frame, wait, err := src.Next()
+			if errors.Is(err, io.EOF) {
+				log.Printf("data source exhausted; holding last values (Ctrl-C to quit)")
+				continue
+			}
+			if err != nil {
+				log.Printf("data source error: %v; holding last values", err)
+				continue
+			}
+			sim.applyFrame(frame)
+			timer.Reset(wait)
 		case <-sigCh:
 			log.Printf("received signal, shutting down")
 			return
@@ -448,7 +493,7 @@ func (s *Simulation) applyFrame(frame Frame) {
 		s.writeValue(area, db, byt, regType, "U16", val)
 	}
 
-	// Dosing amounts keyed by chemical name (matches CSV dosing name).
+	// Dosing amounts keyed by chemical name or "<tankID>:<name>" (matches CSV dosing name).
 	for key, val := range frame.Dosing {
 		def, ok := s.cfg.doseByName[key]
 		if !ok {
@@ -503,8 +548,10 @@ func (s *Simulation) applyFrame(frame Frame) {
 	}
 
 	// Alarms: clear all first, then set the ones listed for this frame.
-	for _, a := range s.cfg.Alarms {
-		s.setBit("db", a.DB, a.ByteOffset, a.Bit, false)
+	if !frame.KeepAlarms {
+		for _, a := range s.cfg.Alarms {
+			s.setBit("db", a.DB, a.ByteOffset, a.Bit, false)
+		}
 	}
 	for _, name := range frame.Alarms {
 		def, ok := s.cfg.alarmByText[name]
@@ -682,12 +729,21 @@ func loadConfig(path string) (Config, error) {
 				continue
 			}
 			serverID, _ := strconv.Atoi(rec[1])
-			db, byteOffset, _ := parseDBOffset(rec[2])
 			regType := strings.TrimSpace(rec[3])
 			area := areaFromRegType(regType)
+			db, byteOffset, _ := parseAreaOffset(area, rec[2])
 			bit, _ := strconv.Atoi(rec[4])
 			val, _ := strconv.Atoi(rec[5])
-			def := StateDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val, Area: area}
+			kind := "trigger"
+			if tag == "[state-dosing]" {
+				kind = "dosing"
+			}
+			stateTank := 0
+			if len(rec) > 6 {
+				stateTank, _ = strconv.Atoi(strings.TrimSpace(rec[6]))
+			}
+			def := StateDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val, Area: area,
+				RegisterType: regType, Kind: kind, TankID: stateTank}
 			cfg.States = append(cfg.States, def)
 
 			// For dosing rows, also capture amount target information.
@@ -707,9 +763,12 @@ func loadConfig(path string) (Config, error) {
 					Multiplier:   mult,
 					DataType:     dataType,
 				}
+				trig := def
+				doseDef.Trigger = &trig
 				cfg.Dosing = append(cfg.Dosing, doseDef)
 				if name != "" {
 					cfg.doseByName[name] = doseDef
+					cfg.doseByName[fmt.Sprintf("%d:%s", tankID, name)] = doseDef
 				}
 			}
 		}
@@ -752,6 +811,16 @@ func parseDBOffset(raw string) (db int, byteOffset int, err error) {
 	}
 	byteOffset, err = strconv.Atoi(parts[1])
 	return
+}
+
+// parseAreaOffset parses a CSV address for the given area. For the Q (process
+// output) area a single number is a byte offset, not a DB number.
+func parseAreaOffset(area, raw string) (db int, byteOffset int, err error) {
+	db, byteOffset, err = parseDBOffset(raw)
+	if err == nil && area == "q" && !strings.ContainsAny(raw, ":|") {
+		return 0, db, nil
+	}
+	return db, byteOffset, err
 }
 
 func parseAddress(raw string) (addr string, rack int, slot int, port int) {
