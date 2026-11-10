@@ -248,7 +248,11 @@ func newDBMapping(cfg *Config, overrides *dbMapFile) *dbMapping {
 		m.pointByCol[pointColumnKey(p)] = p
 	}
 	for _, a := range cfg.Alarms {
-		k, _ := normAddrKey("dbx", fmt.Sprintf("%d|%d", a.DB, a.ByteOffset))
+		reg := a.RegisterType
+		if reg == "" {
+			reg = "dbx"
+		}
+		k, _ := normAddrKey(reg, fmt.Sprintf("%d|%d", a.DB, a.ByteOffset))
 		m.alarmByKey[bitKey(k, a.Bit)] = a
 	}
 	for _, d := range cfg.Dosing {
@@ -418,13 +422,14 @@ func openSQLiteSource(path, mapPath string, cfg *Config, opt replayOptions, insp
 		db.Close()
 		return nil, fmt.Errorf("no DB column matches a [point] in the config; run with -db-inspect and check -config / -db-map")
 	}
+	checkUnmappedTables(db, schema, m)
 	if len(m.unmapped) > 0 {
 		keys := make([]string, 0, len(m.unmapped))
 		for k, why := range m.unmapped {
 			keys = append(keys, fmt.Sprintf("%s (%s)", k, why))
 		}
 		sort.Strings(keys)
-		log.Printf("sqlite replay: %d unmapped columns skipped: %s", len(keys), strings.Join(keys, ", "))
+		log.Printf("sqlite replay: %d unmapped keys skipped: %s", len(keys), strings.Join(keys, ", "))
 	}
 	src, err := newSQLiteSource(db, schema, m, opt)
 	if err != nil {
@@ -438,4 +443,49 @@ func openSQLiteSource(path, mapPath string, cfg *Config, opt replayOptions, insp
 	log.Printf("sqlite replay: %s, %d mapped columns, mode=%s speed=%g max-gap=%s pulse=%v lead=%s alarm-hold=%s loop=%v",
 		path, mapped, mode, opt.Speed, opt.MaxGap, opt.Pulse, opt.PulseLead, opt.AlarmHold, opt.Loop)
 	return src, nil
+}
+
+// checkUnmappedTables checks settings_history, alarms and dosing_records keys
+// at startup so any unmapped entries are reported once in m.unmapped.
+func checkUnmappedTables(db *sql.DB, schema *dbSchema, m *dbMapping) {
+	if schema.has("settings_history", "data_address") {
+		if keys, err := distinctStrings(db, "SELECT DISTINCT data_address FROM settings_history"); err == nil {
+			for _, k := range keys {
+				m.point(k)
+			}
+		}
+	}
+	if schema.has("alarms", "address", "bitfield") {
+		q := "SELECT address, bitfield, '' FROM alarms GROUP BY 1, 2"
+		if schema.has("alarms", "message") {
+			q = "SELECT address, bitfield, coalesce(max(message),'') FROM alarms GROUP BY 1, 2"
+		}
+		if rows, err := db.Query(q); err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var addr, msg string
+				var bit sql.NullInt64
+				if rows.Scan(&addr, &bit, &msg) == nil {
+					if _, ok := m.alarm(addr, bit, msg); !ok {
+						m.unmapped[fmt.Sprintf("alarm:%s#%d", strings.TrimSpace(addr), bit.Int64)] = "no [alarm] match"
+					}
+				}
+			}
+		}
+	}
+	if schema.has("dosing_records", "tank_id", "address", "bitfield", "name") {
+		if rows, err := db.Query("SELECT DISTINCT tank_id, address, bitfield, coalesce(name,'') FROM dosing_records"); err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var tank int
+				var addr, name string
+				var bit sql.NullInt64
+				if rows.Scan(&tank, &addr, &bit, &name) == nil {
+					if _, ok := m.dosing(tank, addr, bit, name); !ok {
+						m.unmapped[fmt.Sprintf("dosing:%d:%s", tank, strings.TrimSpace(name))] = "no [state-dosing] match"
+					}
+				}
+			}
+		}
+	}
 }

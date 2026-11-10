@@ -193,9 +193,9 @@ For each step at time `t`, build a `Frame` and call `applyFrame`:
 4. `AlarmRaise` → set the alarm bit, then clear it later (§7.3).
 
 Required change to `applyFrame`: today it *clears every alarm* on each frame.
-For DB frames, alarm handling switches to explicit set/clear lists. A new field
-`Frame.AlarmsOff []string` is added, plus a flag `Frame.KeepAlarms bool`. The
-JSON behaviour stays as it is.
+For DB frames, a flag `Frame.KeepAlarms bool` skips the clear-all step and alarm
+bits are driven explicitly through `Frame.States`. The JSON behaviour stays as
+it is.
 
 Timing: in `realtime` mode, sleep `min(t_next − t, max-gap) / speed` between
 steps. In `fixed` mode, each distinct timestamp is one step, and steps are

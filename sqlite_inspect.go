@@ -40,6 +40,16 @@ func inspectDB(w io.Writer, db *sql.DB, path string, schema *dbSchema, m *dbMapp
 	if !minT.IsZero() {
 		fmt.Fprintf(w, "range %s .. %s (%s)\n", minT.Format("2006-01-02 15:04:05"), maxT.Format("2006-01-02 15:04:05"), maxT.Sub(minT).Round(time.Second))
 	}
+	if !opt.From.IsZero() || !opt.To.IsZero() {
+		lo, hi := opt.From, opt.To
+		if lo.IsZero() {
+			lo = minT
+		}
+		if hi.IsZero() {
+			hi = maxT
+		}
+		fmt.Fprintf(w, "window %s .. %s\n", lo.Format("2006-01-02 15:04:05"), hi.Format("2006-01-02 15:04:05"))
+	}
 	fmt.Fprintln(w)
 
 	// Dynamic tables.
@@ -58,7 +68,7 @@ func inspectDB(w io.Writer, db *sql.DB, path string, schema *dbSchema, m *dbMapp
 			continue
 		}
 		tanksWithData[dt.Tank] = true
-		if med, gaps, err := rowIntervals(db, dt.Name, opt.MaxGap); err == nil {
+		if med, gaps, err := rowIntervals(db, dt.Name, opt.From, opt.To, opt.MaxGap); err == nil {
 			fmt.Fprintf(w, "  median interval %s", med.Round(10*time.Millisecond))
 			if gaps > 0 {
 				fmt.Fprintf(w, "  gaps>%s: %d", opt.MaxGap, gaps)
@@ -240,7 +250,7 @@ func distinctStrings(db *sql.DB, q string) ([]string, error) {
 }
 
 // rowIntervals returns the median interval between rows and the number of gaps longer than maxGap.
-func rowIntervals(db *sql.DB, table string, maxGap time.Duration) (time.Duration, int, error) {
+func rowIntervals(db *sql.DB, table string, from, to time.Time, maxGap time.Duration) (time.Duration, int, error) {
 	rows, err := db.Query(fmt.Sprintf("SELECT timestamp FROM %s ORDER BY timestamp", quoteIdent(table)))
 	if err != nil {
 		return 0, 0, err
@@ -256,6 +266,9 @@ func rowIntervals(db *sql.DB, table string, maxGap time.Duration) (time.Duration
 		}
 		t, err := parseTS(s)
 		if err != nil {
+			continue
+		}
+		if (!from.IsZero() && t.Before(from)) || (!to.IsZero() && !t.Before(to)) {
 			continue
 		}
 		if !prev.IsZero() {

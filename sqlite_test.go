@@ -492,3 +492,78 @@ func TestIntegerWritesRound(t *testing.T) {
 		t.Errorf("S16 -2.5000001 = %d, want -3", got)
 	}
 }
+
+func TestAlarmBitfieldAndPulseLeadAfterAlarm(t *testing.T) {
+	csv := `[server],1,s7,127.0.0.1|0|1|102,0,1000
+[state-trigger],1,31|0,dbx,0,1,1,,0,
+[point],1,游离碱,g/L,1,10|0,dbw,100,U16,20|2,20|4,20|6,1
+[alarm],1,30|13,dbx,0,1,报警bit0
+[alarm],1,30|13,dbx,3,1,报警bit3
+`
+	cp := filepath.Join(t.TempDir(), "cfg.csv")
+	if err := os.WriteFile(cp, []byte(csv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Alarms[1].Bit != 3 || cfg.Alarms[1].Value != 1 {
+		t.Fatalf("alarm bit/val = %+v, want Bit=3 Value=1", cfg.Alarms[1])
+	}
+
+	dp := filepath.Join(t.TempDir(), "rec.db")
+	db, _ := sql.Open("sqlite", dp)
+	for _, q := range []string{
+		`CREATE TABLE dynamic_data_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, "1-dbw-10|0" REAL)`,
+		`CREATE TABLE alarms (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, address TEXT NOT NULL, bitfield INTEGER, message TEXT)`,
+		`INSERT INTO dynamic_data_1 (timestamp, "1-dbw-10|0") VALUES ('2026-07-16T17:00:00.000+08:00', 2.0), ('2026-07-16T17:00:04.000+08:00', 2.5)`,
+		// Alarm on bit 3 arrives 200ms before the second data row (17:00:03.800).
+		`INSERT INTO alarms (timestamp, address, bitfield, message) VALUES ('2026-07-16T17:00:03.800+08:00', 'dbx-30|13', 3, '')`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	src, err := openSQLiteSource(dp, "", &cfg, defaultTestOpt(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	var highAt, lowAt, alarm3At []time.Duration
+	var at time.Duration
+	for {
+		f, wait, err := src.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := f.States["31:0:0"]; ok {
+			if v == 1 {
+				highAt = append(highAt, at)
+			} else if at > 0 {
+				lowAt = append(lowAt, at)
+			}
+		}
+		if v, ok := f.States["30:13:3"]; ok && v == 1 {
+			alarm3At = append(alarm3At, at)
+		}
+		at += wait
+	}
+	// First data row at v=2s (high at 1s, low at 2s).
+	// Second data row at v=6s: despite the alarm at v=5.8s, trigger must still rise at 5s (full 1s PulseLead).
+	if !equalDur(highAt, []time.Duration{time.Second, 5 * time.Second}) {
+		t.Errorf("trigger high at %v, want [1s 5s]", highAt)
+	}
+	if !equalDur(lowAt, []time.Duration{2 * time.Second, 6 * time.Second}) {
+		t.Errorf("trigger low at %v, want [2s 6s]", lowAt)
+	}
+	if !equalDur(alarm3At, []time.Duration{5800 * time.Millisecond}) {
+		t.Errorf("alarm bit 3 raised at %v, want [5.8s]", alarm3At)
+	}
+}

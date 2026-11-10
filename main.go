@@ -57,12 +57,13 @@ type PointDef struct {
 
 // AlarmDef maps a single alarm bit.
 type AlarmDef struct {
-	ServerID   int
-	DB         int
-	ByteOffset int
-	Bit        int
-	Value      int
-	Message    string
+	ServerID     int
+	DB           int
+	ByteOffset   int
+	Bit          int
+	Value        int
+	RegisterType string
+	Message      string
 }
 
 // StateDef describes a state bit we may toggle.
@@ -485,7 +486,7 @@ func (s *Simulation) applyDefaults() {
 		s.setBit(area, st.DB, st.ByteOffset, st.Bit, st.Value != 0)
 	}
 	for _, a := range s.cfg.Alarms {
-		s.setBit("db", a.DB, a.ByteOffset, a.Bit, a.Value != 0)
+		s.setBit("db", a.DB, a.ByteOffset, a.Bit, false)
 	}
 }
 
@@ -787,10 +788,11 @@ func loadConfig(path string) (Config, error) {
 			}
 			serverID, _ := strconv.Atoi(rec[1])
 			db, byteOffset, _ := parseDBOffset(rec[2])
-			bit, _ := strconv.Atoi(rec[3])
-			val, _ := strconv.Atoi(rec[4])
+			regType := defaultStr(rec[3], "dbx")
+			bit, _ := strconv.Atoi(rec[4])
+			val, _ := strconv.Atoi(defaultStr(rec[5], "1"))
 			msg := strings.TrimSpace(rec[6])
-			def := AlarmDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val, Message: msg}
+			def := AlarmDef{ServerID: serverID, DB: db, ByteOffset: byteOffset, Bit: bit, Value: val, RegisterType: regType, Message: msg}
 			cfg.Alarms = append(cfg.Alarms, def)
 			if msg != "" {
 				cfg.alarmByText[msg] = def
@@ -837,9 +839,9 @@ func loadConfig(path string) (Config, error) {
 				trig := def
 				doseDef.Trigger = &trig
 				cfg.Dosing = append(cfg.Dosing, doseDef)
+				cfg.doseByName[fmt.Sprintf("%d:%s", tankID, name)] = doseDef
 				if name != "" {
 					cfg.doseByName[name] = doseDef
-					cfg.doseByName[fmt.Sprintf("%d:%s", tankID, name)] = doseDef
 				}
 			}
 		}

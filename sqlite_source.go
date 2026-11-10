@@ -41,6 +41,8 @@ const (
 
 type dbEvent struct {
 	t          time.Time
+	rawTS      string
+	rowID      int64
 	kind       evKind
 	tank       int
 	points     map[string]float64 // evData: point key -> value (scaled)
@@ -59,14 +61,27 @@ type cursor struct {
 	table    string
 	cols     []string // selected columns after rowid, timestamp
 	pageSize int
+	minDate  string // optional YYYY-MM-DD lower bound from -db-from
 	conv     func(ts time.Time, vals []any) (dbEvent, bool)
 
-	lastTS  string
-	lastID  int64
-	started bool
-	buf     []dbEvent
-	done    bool
-	badTS   int
+	lastTS   string
+	lastID   int64
+	started  bool
+	startTS  string
+	startID  int64
+	hasStart bool
+	buf      []dbEvent
+	done     bool
+	badTS    int
+}
+
+func (c *cursor) rewind() {
+	c.lastTS = c.startTS
+	c.lastID = c.startID
+	c.started = c.hasStart
+	c.buf = c.buf[:0]
+	c.done = false
+	c.badTS = 0
 }
 
 func (c *cursor) fill() error {
@@ -80,6 +95,9 @@ func (c *cursor) fill() error {
 		if c.started {
 			q += " WHERE timestamp > ? OR (timestamp = ? AND rowid > ?)"
 			args = []any{c.lastTS, c.lastTS, c.lastID}
+		} else if c.minDate != "" {
+			q += " WHERE timestamp >= ?"
+			args = []any{c.minDate}
 		}
 		q += fmt.Sprintf(" ORDER BY timestamp, rowid LIMIT %d", c.pageSize)
 		rows, err := c.db.Query(q, args...)
@@ -107,6 +125,7 @@ func (c *cursor) fill() error {
 				continue
 			}
 			if ev, ok := c.conv(ts, vals[2:]); ok {
+				ev.rawTS, ev.rowID = c.lastTS, c.lastID
 				c.buf = append(c.buf, ev)
 			}
 		}
@@ -231,6 +250,7 @@ type sqliteSource struct {
 	prevV    time.Duration // virtual time of last planned step
 	prevT    time.Time     // source time of last planned step
 	havePrev bool
+	lastFall map[string]time.Duration // state bit key -> virtual time of last falling edge
 
 	alarmClear map[string]*action // alarm bit key -> pending clear
 	alarmRaise map[string]time.Duration
@@ -353,14 +373,29 @@ func (s *sqliteSource) buildCursors() []*cursor {
 				return dbEvent{t: ts, kind: evDose, dose: def, amount: amt}, ok && okAmt
 			}})
 	}
+	var minDate string
+	if !s.opt.From.IsZero() {
+		// Safe coarse lower bound (1-day margin handles any timezone/format differences).
+		minDate = s.opt.From.Add(-24 * time.Hour).Format("2006-01-02")
+	}
+	for _, c := range cs {
+		c.minDate = minDate
+	}
 	return cs
 }
 
 // reset (re)opens all cursors at the start of the window.
 func (s *sqliteSource) reset() error {
-	s.cursors = s.buildCursors()
+	if len(s.cursors) == 0 {
+		s.cursors = s.buildCursors()
+	} else {
+		for _, c := range s.cursors {
+			c.rewind()
+		}
+	}
 	s.peeked = nil
 	s.havePrev = false
+	s.lastFall = map[string]time.Duration{}
 	s.pass++
 	return s.peekStep()
 }
@@ -401,6 +436,10 @@ func (s *sqliteSource) peekStep() error {
 				}
 				if !skip {
 					s.peeked = append(s.peeked, *ev)
+				} else if s.pass == 1 {
+					// Record the last row before opt.From so subsequent loop
+					// passes seek directly to the window start.
+					c.startTS, c.startID, c.hasStart = ev.rawTS, ev.rowID, true
 				}
 				c.pop()
 			}
@@ -443,14 +482,6 @@ func (s *sqliteSource) nextStepV() time.Duration {
 // planStep converts the peeked step into scheduled actions.
 func (s *sqliteSource) planStep() error {
 	v := s.nextStepV()
-	prevV := s.prevV
-	if !s.havePrev {
-		prevV = s.cur
-	}
-	lead := s.opt.PulseLead
-	if half := (v - prevV) / 2; half < lead {
-		lead = half
-	}
 	t := s.peeked[0].t
 	if s.steps == 0 && s.pass == 1 {
 		s.firstT = t
@@ -520,7 +551,20 @@ func (s *sqliteSource) planStep() error {
 	}
 
 	if !frameEmpty(pre) {
+		prevFall := s.cur
+		for k := range at.States {
+			if f, ok := s.lastFall[k]; ok && f > prevFall {
+				prevFall = f
+			}
+		}
+		lead := s.opt.PulseLead
+		if half := (v - prevFall) / 2; half < lead {
+			lead = half
+		}
 		s.schedule(v-lead, func(f *Frame) { mergeFrame(f, pre) })
+		for k := range at.States {
+			s.lastFall[k] = v
+		}
 	}
 	if !frameEmpty(at) {
 		s.schedule(v, func(f *Frame) { mergeFrame(f, at) })
@@ -563,6 +607,9 @@ func (s *sqliteSource) Next() (Frame, time.Duration, error) {
 			break
 		}
 		// Data exhausted.
+		if bad := s.badTimestamps(); bad > 0 {
+			log.Printf("replay: skipped %d rows with unparsable timestamps in pass %d", bad, s.pass)
+		}
 		if !s.opt.Loop {
 			return Frame{}, 0, io.EOF
 		}
